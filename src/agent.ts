@@ -1,6 +1,6 @@
 // ============================================================
 // SADIE HARTLEY - Agent (Durable Object)
-// Version: 1.0.1 - Fixed SQL queries
+// Version: 1.0.2 - Test deploy after wrangler.toml fix
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
