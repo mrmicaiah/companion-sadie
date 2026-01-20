@@ -1,5 +1,6 @@
 // ============================================================
 // SADIE HARTLEY - Agent (Durable Object)
+// Version: 1.0.1 - Fixed SQL queries
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -129,8 +130,9 @@ export class SadieAgent {
       
       if (url.pathname.startsWith('/admin/users/')) {
         const chatId = url.pathname.split('/').pop();
-        const user = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).one();
-        if (!user) return this.jsonResponse({ error: 'User not found' }, 404);
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+        if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
+        const user = userResult[0];
         
         const sessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 10`, chatId).toArray();
         const recentMessages = this.sql.exec(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray();
@@ -139,9 +141,9 @@ export class SadieAgent {
       }
       
       if (url.pathname === '/debug/stats') {
-        const userCount = this.sql.exec(`SELECT COUNT(*) as count FROM users`).one();
-        const messageCount = this.sql.exec(`SELECT COUNT(*) as count FROM messages`).one();
-        const sessionCount = this.sql.exec(`SELECT COUNT(*) as count FROM sessions`).one();
+        const userCount = this.sql.exec(`SELECT COUNT(*) as count FROM users`).toArray()[0];
+        const messageCount = this.sql.exec(`SELECT COUNT(*) as count FROM messages`).toArray()[0];
+        const sessionCount = this.sql.exec(`SELECT COUNT(*) as count FROM sessions`).toArray()[0];
         const statusBreakdown = this.sql.exec(`SELECT status, COUNT(*) as count FROM users GROUP BY status`).toArray();
         
         return this.jsonResponse({
@@ -169,7 +171,8 @@ export class SadieAgent {
     const { content, chatId, user: telegramUser, refCode } = data;
     const now = new Date();
     
-    let user = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).one() as User | null;
+    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+    let user = userResult.length > 0 ? userResult[0] as User : null;
     const isFirstTimeUser = !user;
     
     if (!user) {
@@ -179,7 +182,8 @@ export class SadieAgent {
       `, chatId, telegramUser.id, telegramUser.firstName, telegramUser.lastName || null, 
          telegramUser.username || null, now.toISOString(), now.toISOString(), TRIAL_MESSAGE_LIMIT, refCode || null);
       
-      user = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).one() as User;
+      const newUserResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+      user = newUserResult[0] as User;
     }
     
     if (content === '__START__') {
@@ -189,12 +193,13 @@ export class SadieAgent {
     
     if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
       await this.sendMessage(chatId, 
-        `Hey ${user.first_name}! You've used your free messages. Upgrade to keep the fun going: [Link coming soon]`
+        `Hey ${user.first_name}! You've used all your free messages. To keep chatting, upgrade to unlimited access! 💬\n\n[Link to upgrade coming soon]`
       );
       return;
     }
     
-    const lastSession = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).one() as Session | null;
+    const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
+    const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
     const needsNewSession = !lastSession || 
       (now.getTime() - new Date(lastSession.started_at).getTime() > 2 * 60 * 60 * 1000);
@@ -234,7 +239,7 @@ export class SadieAgent {
       model: 'claude-sonnet-4-20250514',
       max_tokens: 300,
       system: SYSTEM_PROMPT + `\n\n${welcomePrompt}`,
-      messages: [{ role: 'user', content: '[SYSTEM: User just started a chat. Send your opening message.]' }]
+      messages: [{ role: 'user', content: '[SYSTEM: User just clicked to chat from the website. Send your opening message.]' }]
     });
     
     const textBlock = response.content.find(b => b.type === 'text');
@@ -295,8 +300,9 @@ export class SadieAgent {
   }
 
   private updateUserStatus(chatId: string): void {
-    const user = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).one() as User;
-    if (!user) return;
+    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+    if (userResult.length === 0) return;
+    const user = userResult[0] as User;
     
     if (user.status === 'trial' && user.message_count >= 10) {
       this.sql.exec(`UPDATE users SET status = 'hooked' WHERE chat_id = ?`, chatId);
@@ -342,7 +348,8 @@ export class SadieAgent {
   }
 
   private async sendProactiveMessage(user: User): Promise<void> {
-    const lastSession = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 1`, user.chat_id).one() as Session | null;
+    const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 1`, user.chat_id).toArray();
+    const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
