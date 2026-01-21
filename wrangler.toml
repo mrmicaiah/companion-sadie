@@ -15,6 +15,11 @@ class_name = "SadieAgent"
 tag = "v1"
 new_sqlite_classes = ["SadieAgent"]
 
-# Secrets (set via Cloudflare dashboard):
+[vars]
+BILLING_URL = "https://topfivefriends.com"
+
+# Secrets (set via Cloudflare dashboard or wrangler secret put):
 # - ANTHROPIC_API_KEY
 # - TELEGRAM_BOT_TOKEN
+# - TELEGRAM_WEBHOOK_SECRET
+# - RESEND_API_KEY

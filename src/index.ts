@@ -1,5 +1,6 @@
 // ============================================================
 // SADIE HARTLEY - Character Worker
+// Version: 2.0.0 - Magic Link Support
 // ============================================================
 
 import { SadieAgent } from './agent';
@@ -7,7 +8,7 @@ import { SadieAgent } from './agent';
 export { SadieAgent };
 
 const VERSION = {
-  version: '1.0.3',
+  version: '2.0.0',
   character: 'sadie',
   display_name: 'Sadie Hartley'
 };
@@ -18,6 +19,8 @@ interface Env {
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
+  RESEND_API_KEY: string;
+  BILLING_URL: string;
 }
 
 interface TelegramUpdate {
@@ -143,7 +146,10 @@ export default {
       });
     }
 
-    if (url.pathname.startsWith('/debug/') || url.pathname.startsWith('/admin/')) {
+    // Pass through to Durable Object for debug/admin/billing endpoints
+    if (url.pathname.startsWith('/debug/') || 
+        url.pathname.startsWith('/admin/') ||
+        url.pathname.startsWith('/billing/')) {
       return character.fetch(request);
     }
 

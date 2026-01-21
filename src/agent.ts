@@ -1,6 +1,6 @@
 // ============================================================
 // SADIE HARTLEY - Agent (Durable Object)
-// Version: 2.0.1 - Fixed R2 initialization for existing users
+// Version: 3.0.0 - Magic Link + Trial System
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -20,9 +20,11 @@ interface Env {
   MEMORY: R2Bucket;
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
+  RESEND_API_KEY: string;
+  BILLING_URL: string; // e.g., https://topfivefriends.com or billing worker URL
 }
 
-type UserStatus = 'new' | 'trial' | 'hooked' | 'active' | 'paused' | 'churned';
+type UserStatus = 'new' | 'trial' | 'awaiting_email' | 'pending_payment' | 'active' | 'paused' | 'churned';
 
 interface User {
   chat_id: string;
@@ -31,6 +33,8 @@ interface User {
   last_name?: string;
   username?: string;
   status: UserStatus;
+  email?: string;
+  account_id?: string;
   message_count: number;
   trial_messages_remaining: number;
   created_at: string;
@@ -38,6 +42,17 @@ interface User {
   last_outreach_at?: string;
   timezone_offset?: number;
   ref_code?: string;
+}
+
+interface PendingLink {
+  id: string;
+  chat_id: string;
+  email: string;
+  token: string;
+  character: string;
+  created_at: string;
+  expires_at: string;
+  used: number;
 }
 
 interface Session {
@@ -52,6 +67,12 @@ interface Session {
 const TRIAL_MESSAGE_LIMIT = 25;
 const SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
 const EXTRACTION_DELAY_MS = 15 * 60 * 1000; // 15 minutes of silence
+const MAGIC_LINK_EXPIRY_HOURS = 24;
+const CHARACTER_NAME = 'sadie';
+const CHARACTER_DISPLAY = 'Sadie';
+
+// Email regex pattern
+const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 
 export class SadieAgent {
   private state: DurableObjectState;
@@ -74,6 +95,8 @@ export class SadieAgent {
         last_name TEXT,
         username TEXT,
         status TEXT DEFAULT 'new',
+        email TEXT,
+        account_id TEXT,
         message_count INTEGER DEFAULT 0,
         trial_messages_remaining INTEGER DEFAULT ${TRIAL_MESSAGE_LIMIT},
         created_at TEXT,
@@ -81,6 +104,17 @@ export class SadieAgent {
         last_outreach_at TEXT,
         timezone_offset INTEGER,
         ref_code TEXT
+      );
+      
+      CREATE TABLE IF NOT EXISTS pending_links (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        email TEXT NOT NULL,
+        token TEXT UNIQUE NOT NULL,
+        character TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used INTEGER DEFAULT 0
       );
       
       CREATE TABLE IF NOT EXISTS messages (
@@ -107,6 +141,8 @@ export class SadieAgent {
       CREATE INDEX IF NOT EXISTS idx_sessions_chat ON sessions(chat_id);
       CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
       CREATE INDEX IF NOT EXISTS idx_users_last_message ON users(last_message_at);
+      CREATE INDEX IF NOT EXISTS idx_pending_links_token ON pending_links(token);
+      CREATE INDEX IF NOT EXISTS idx_pending_links_chat ON pending_links(chat_id);
     `);
   }
 
@@ -124,6 +160,41 @@ export class SadieAgent {
         };
         await this.handleMessage(data);
         return new Response('OK');
+      }
+      
+      // Endpoint for billing system to verify/activate user
+      if (url.pathname === '/billing/activate' && request.method === 'POST') {
+        const data = await request.json() as { chat_id: string; account_id: string; email: string };
+        await this.activateUser(data.chat_id, data.account_id, data.email);
+        return this.jsonResponse({ success: true });
+      }
+      
+      // Endpoint to check user status (for billing system)
+      if (url.pathname.startsWith('/billing/status/')) {
+        const chatId = url.pathname.split('/').pop();
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+        if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
+        const user = userResult[0] as User;
+        return this.jsonResponse({ 
+          status: user.status, 
+          email: user.email,
+          account_id: user.account_id,
+          trial_remaining: user.trial_messages_remaining
+        });
+      }
+      
+      // Endpoint for billing system to look up pending link by token
+      if (url.pathname.startsWith('/billing/pending/')) {
+        const token = url.pathname.split('/billing/pending/')[1];
+        const linkResult = this.sql.exec(`
+          SELECT pl.*, u.first_name 
+          FROM pending_links pl
+          JOIN users u ON pl.chat_id = u.chat_id
+          WHERE pl.token = ? AND pl.used = 0 AND pl.expires_at > ?
+        `, token, new Date().toISOString()).toArray();
+        
+        if (linkResult.length === 0) return this.jsonResponse({ error: 'Not found' }, 404);
+        return this.jsonResponse(linkResult[0]);
       }
       
       if (url.pathname === '/rhythm/checkAllUsers') {
@@ -146,6 +217,11 @@ export class SadieAgent {
         return this.jsonResponse({ users, count: users.length });
       }
       
+      if (url.pathname === '/admin/pending-links') {
+        const links = this.sql.exec(`SELECT * FROM pending_links WHERE used = 0 ORDER BY created_at DESC LIMIT 50`).toArray();
+        return this.jsonResponse({ links, count: links.length });
+      }
+      
       if (url.pathname.startsWith('/admin/users/')) {
         const chatId = url.pathname.split('/').pop();
         const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
@@ -155,7 +231,6 @@ export class SadieAgent {
         const sessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 10`, chatId).toArray();
         const recentMessages = this.sql.exec(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray();
         
-        // Load R2 memory
         const memory = await loadHotMemory(this.env.MEMORY, chatId as string);
         
         return this.jsonResponse({ user, sessions, recentMessages, memory });
@@ -166,16 +241,17 @@ export class SadieAgent {
         const messageCount = this.sql.exec(`SELECT COUNT(*) as count FROM messages`).toArray()[0];
         const sessionCount = this.sql.exec(`SELECT COUNT(*) as count FROM sessions`).toArray()[0];
         const statusBreakdown = this.sql.exec(`SELECT status, COUNT(*) as count FROM users GROUP BY status`).toArray();
+        const pendingLinks = this.sql.exec(`SELECT COUNT(*) as count FROM pending_links WHERE used = 0`).toArray()[0];
         
         return this.jsonResponse({
           users: userCount?.count || 0,
           messages: messageCount?.count || 0,
           sessions: sessionCount?.count || 0,
+          pendingLinks: pendingLinks?.count || 0,
           byStatus: statusBreakdown
         });
       }
       
-      // Debug endpoint to test R2 connection
       if (url.pathname === '/debug/test-r2') {
         try {
           const testKey = `test/connection_${Date.now()}.json`;
@@ -189,7 +265,15 @@ export class SadieAgent {
         }
       }
       
-      // Debug endpoint to manually initialize memory for a user
+      if (url.pathname === '/debug/test-email') {
+        // Test email sending
+        const testEmail = url.searchParams.get('email');
+        if (!testEmail) return this.jsonResponse({ error: 'Provide ?email=...' }, 400);
+        
+        const result = await this.sendMagicLinkEmail(testEmail, 'test-token-123', 'Test User');
+        return this.jsonResponse({ success: result, email: testEmail });
+      }
+      
       if (url.pathname.startsWith('/debug/init-memory/')) {
         const chatId = url.pathname.split('/').pop();
         const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
@@ -235,7 +319,7 @@ export class SadieAgent {
       user = newUserResult[0] as User;
     }
     
-    // ALWAYS ensure R2 memory exists (fixes existing users who don't have it)
+    // ALWAYS ensure R2 memory exists
     await initializeUserMemory(this.env.MEMORY, chatId, user.first_name);
     
     // Handle /start command
@@ -244,13 +328,65 @@ export class SadieAgent {
       return;
     }
     
-    // Check trial limit
-    if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
-      await this.sendMessage(chatId, 
-        `hey ${user.first_name}! you've used all your free messages. to keep chatting, upgrade to unlimited access 💬\n\n[link coming soon]`
+    // ========================================
+    // MAGIC LINK FLOW - Check if awaiting email
+    // ========================================
+    if (user.status === 'awaiting_email') {
+      // Check if this message looks like an email
+      const trimmedContent = content.trim().toLowerCase();
+      
+      if (EMAIL_REGEX.test(trimmedContent)) {
+        // Valid email - create magic link
+        await this.handleEmailSubmission(user, trimmedContent);
+        return;
+      } else {
+        // Not an email - remind them
+        await this.sendMessage(chatId, 
+          `hmm that doesn't look like an email address 🤔 just type your email and i'll send you a link to get set up!`
+        );
+        return;
+      }
+    }
+    
+    // Check if user already submitted email and is pending payment
+    if (user.status === 'pending_payment') {
+      // Allow re-sending if they type another email
+      const trimmedContent = content.trim().toLowerCase();
+      if (EMAIL_REGEX.test(trimmedContent)) {
+        await this.handleEmailSubmission(user, trimmedContent);
+        return;
+      }
+      
+      await this.sendMessage(chatId,
+        `i already sent you a magic link! check your inbox at ${user.email} 📬\n\nif you can't find it, just type your email again and i'll send a new one.`
       );
       return;
     }
+    
+    // ========================================
+    // TRIAL LIMIT CHECK
+    // ========================================
+    if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
+      // Trial exhausted - ask for email
+      this.sql.exec(`UPDATE users SET status = 'awaiting_email' WHERE chat_id = ?`, chatId);
+      
+      await this.sendMessage(chatId, 
+        `hey ${user.first_name}! 💜 i've really loved getting to know you these past few conversations.\n\nto keep chatting, i just need your email so we can get you set up. what's a good email for you?`
+      );
+      return;
+    }
+    
+    // ========================================
+    // ACTIVE USER CHECK
+    // ========================================
+    if (user.status !== 'trial' && user.status !== 'active') {
+      // User in weird state (paused, churned, etc) - check if they have active account
+      // For now, let them through
+    }
+    
+    // ========================================
+    // NORMAL MESSAGE HANDLING
+    // ========================================
     
     // Session management
     const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
@@ -262,7 +398,6 @@ export class SadieAgent {
     let sessionId: string;
     
     if (needsNewSession) {
-      // Close previous session and run extractions
       if (lastSession && !lastSession.ended_at) {
         await this.closeSession(lastSession.id, chatId, lastSession.message_count);
       }
@@ -276,7 +411,13 @@ export class SadieAgent {
     // Store user message
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)`, chatId, sessionId, content, now.toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
-    this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    
+    // Decrement trial if applicable
+    if (user.status === 'trial') {
+      this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    } else {
+      this.sql.exec(`UPDATE users SET message_count = message_count + 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
+    }
     
     // Generate response with memory
     const response = await this.generateResponse(chatId, sessionId, user);
@@ -288,20 +429,151 @@ export class SadieAgent {
     // Send to Telegram
     await this.sendMessage(chatId, response);
     
-    // Update user status
+    // Update user status if hooked
     this.updateUserStatus(chatId);
   }
+
+  // ========================================
+  // MAGIC LINK FUNCTIONS
+  // ========================================
+
+  private async handleEmailSubmission(user: User, email: string): Promise<void> {
+    const now = new Date();
+    const token = this.generateToken();
+    const expiresAt = new Date(now.getTime() + MAGIC_LINK_EXPIRY_HOURS * 60 * 60 * 1000);
+    
+    // Create pending link record
+    const linkId = `link_${user.chat_id}_${Date.now()}`;
+    this.sql.exec(`
+      INSERT INTO pending_links (id, chat_id, email, token, character, created_at, expires_at, used)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+    `, linkId, user.chat_id, email, token, CHARACTER_NAME, now.toISOString(), expiresAt.toISOString());
+    
+    // Update user status and store email
+    this.sql.exec(`UPDATE users SET status = 'pending_payment', email = ? WHERE chat_id = ?`, email, user.chat_id);
+    
+    // Send magic link email
+    const emailSent = await this.sendMagicLinkEmail(email, token, user.first_name);
+    
+    if (emailSent) {
+      await this.sendMessage(user.chat_id,
+        `perfect! 💌 i just sent a magic link to ${email}\n\nclick it to pick your plan and we can keep this going! check your spam folder if you don't see it in a minute.`
+      );
+    } else {
+      // Email failed - revert status
+      this.sql.exec(`UPDATE users SET status = 'awaiting_email' WHERE chat_id = ?`, user.chat_id);
+      await this.sendMessage(user.chat_id,
+        `hmm something went wrong sending that email 😅 can you double-check the address and try again?`
+      );
+    }
+  }
+
+  private generateToken(): string {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+    let token = '';
+    for (let i = 0; i < 32; i++) {
+      token += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return token;
+  }
+
+  private async sendMagicLinkEmail(email: string, token: string, firstName: string): Promise<boolean> {
+    const magicLink = `${this.env.BILLING_URL}/magic/${token}`;
+    
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.env.RESEND_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: `${CHARACTER_DISPLAY} <no-reply@topfivefriends.com>`,
+          to: [email],
+          subject: `hey ${firstName}! your link to keep chatting 💬`,
+          html: `
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 500px; margin: 0 auto; padding: 40px 20px;">
+              <h1 style="font-size: 24px; font-weight: 600; color: #1a1a1a; margin-bottom: 24px;">
+                hey ${firstName}! 👋
+              </h1>
+              
+              <p style="font-size: 16px; line-height: 1.6; color: #4a4a4a; margin-bottom: 16px;">
+                it's ${CHARACTER_DISPLAY} — you clicked through! i'm so glad you want to keep talking.
+              </p>
+              
+              <p style="font-size: 16px; line-height: 1.6; color: #4a4a4a; margin-bottom: 32px;">
+                click the button below to pick your plan and we can get back to it:
+              </p>
+              
+              <a href="${magicLink}" style="display: inline-block; background: #7c3aed; color: white; font-size: 16px; font-weight: 600; padding: 14px 32px; border-radius: 8px; text-decoration: none; margin-bottom: 32px;">
+                Choose Your Plan →
+              </a>
+              
+              <p style="font-size: 14px; color: #888; margin-top: 32px;">
+                this link expires in 24 hours. if you didn't request this, you can ignore it.
+              </p>
+              
+              <p style="font-size: 14px; color: #888; margin-top: 24px;">
+                — ${CHARACTER_DISPLAY} 💜<br>
+                <span style="color: #aaa;">Top Five Friends</span>
+              </p>
+            </div>
+          `
+        })
+      });
+      
+      if (!response.ok) {
+        const error = await response.text();
+        console.error('Resend error:', error);
+        return false;
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('Email send error:', error);
+      return false;
+    }
+  }
+
+  private async activateUser(chatId: string, accountId: string, email: string): Promise<void> {
+    this.sql.exec(`
+      UPDATE users 
+      SET status = 'active', account_id = ?, email = ?
+      WHERE chat_id = ?
+    `, accountId, email, chatId);
+    
+    // Mark pending links as used
+    this.sql.exec(`UPDATE pending_links SET used = 1 WHERE chat_id = ?`, chatId);
+    
+    // Send welcome back message
+    const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+    if (userResult.length > 0) {
+      const user = userResult[0] as User;
+      await this.sendMessage(chatId,
+        `you're all set ${user.first_name}! 🎉 unlimited chats unlocked. so... where were we? 😊`
+      );
+    }
+  }
+
+  // ========================================
+  // EXISTING FUNCTIONS (slightly modified)
+  // ========================================
 
   private async sendWelcomeMessage(user: User, isFirstTime: boolean): Promise<void> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    // Load memory for returning users
     const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
     const memoryContext = formatMemoryForPrompt(memory);
     
-    const welcomeContext = isFirstTime 
-      ? `\n\n[CONTEXT: ${user.first_name} just started chatting with you for the first time. Be warm, introduce yourself naturally, maybe ask what brings them here or what's on their mind. Keep it light.]`
-      : `\n\n[CONTEXT: ${user.first_name} is back! You've talked before. Be casual and welcoming, maybe reference something from your history if relevant.]`;
+    let welcomeContext: string;
+    
+    if (user.status === 'active') {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} is a paying subscriber coming back. Be warm and excited to chat again!]`;
+    } else if (isFirstTime) {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} just started chatting with you for the first time. Be warm, introduce yourself naturally, maybe ask what brings them here or what's on their mind. Keep it light. They have ${TRIAL_MESSAGE_LIMIT} free messages.]`;
+    } else {
+      welcomeContext = `\n\n[CONTEXT: ${user.first_name} is back! You've talked before. Be casual and welcoming, maybe reference something from your history if relevant.]`;
+    }
     
     const systemPrompt = buildPrompt(
       '[new conversation starting]',
@@ -325,25 +597,29 @@ export class SadieAgent {
   private async generateResponse(chatId: string, sessionId: string, user: User): Promise<string> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    // Load conversation history
     const recentMessages = this.sql.exec(`SELECT role, content FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray().reverse();
     
-    // Get the last user message for context detection
     const lastUserMessage = recentMessages.filter(m => m.role === 'user').pop();
     const messageContent = lastUserMessage?.content as string || '';
     
-    // Load R2 memory
     const memory = await loadHotMemory(this.env.MEMORY, chatId);
     const memoryContext = formatMemoryForPrompt(memory);
     
-    // Build dynamic prompt based on message content and phase
+    // Add trial countdown context if applicable
+    let trialContext = '';
+    if (user.status === 'trial') {
+      const remaining = user.trial_messages_remaining - 1; // -1 because we already decremented
+      if (remaining <= 5 && remaining > 0) {
+        trialContext = `\n\n[SYSTEM NOTE: User has ${remaining} free messages remaining. Don't mention this unless natural.]`;
+      }
+    }
+    
     const systemPrompt = buildPrompt(
       messageContent,
       new Date(),
       memory.relationship.phase
-    ) + memoryContext;
+    ) + memoryContext + trialContext;
     
-    // Format messages for API
     const messages = recentMessages.map(m => ({
       role: m.role as 'user' | 'assistant',
       content: m.content as string
@@ -380,16 +656,13 @@ export class SadieAgent {
     if (userResult.length === 0) return;
     const user = userResult[0] as User;
     
-    if (user.status === 'trial' && user.message_count >= 10) {
-      this.sql.exec(`UPDATE users SET status = 'hooked' WHERE chat_id = ?`, chatId);
-    }
+    // No longer updating to 'hooked' - keep trial until they hit limit
   }
 
   private async closeSession(sessionId: string, chatId: string, messageCount: number): Promise<void> {
     const now = new Date().toISOString();
     this.sql.exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, sessionId);
     
-    // Run extractions if enough messages
     if (messageCount >= 4) {
       const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, sessionId).toArray();
       const transcript = messages.map(m => `${m.role}: ${m.content}`).join('\n');
@@ -414,7 +687,6 @@ export class SadieAgent {
   }
 
   private async processStaleExtractions(): Promise<void> {
-    // Find sessions that ended more than 15 min ago without extractions
     const cutoff = new Date(Date.now() - EXTRACTION_DELAY_MS).toISOString();
     
     const staleSessions = this.sql.exec(`
@@ -454,9 +726,10 @@ export class SadieAgent {
     const cutoffStart = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
     const cutoffEnd = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     
+    // Only reach out to trial or active users, not those awaiting email/payment
     const eligibleUsers = this.sql.exec(`
       SELECT * FROM users 
-      WHERE status IN ('trial', 'hooked', 'active')
+      WHERE status IN ('trial', 'active')
       AND last_message_at < ? AND last_message_at > ?
       AND (last_outreach_at IS NULL OR last_outreach_at < last_message_at)
       LIMIT 10
@@ -470,11 +743,9 @@ export class SadieAgent {
   private async sendProactiveMessage(user: User): Promise<void> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    // Load memory for context
     const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
     const memoryContext = formatMemoryForPrompt(memory);
     
-    // Check for active threads to follow up on
     const activeThreads = memory.threads.active_threads.filter(t => {
       const followUp = new Date(t.follow_up_after);
       return !t.resolved && followUp <= new Date();
@@ -514,7 +785,6 @@ export class SadieAgent {
   private async cleanup(): Promise<void> {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     
-    // Archive old sessions to R2
     const oldSessions = this.sql.exec(`SELECT * FROM sessions WHERE ended_at < ?`, cutoff).toArray();
     
     if (oldSessions.length > 0) {
@@ -527,9 +797,13 @@ export class SadieAgent {
       }
     }
     
+    // Clean up expired pending links
+    const linkCutoff = new Date().toISOString();
+    this.sql.exec(`DELETE FROM pending_links WHERE expires_at < ? AND used = 0`, linkCutoff);
+    
     // Update user statuses
     const pauseCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-    this.sql.exec(`UPDATE users SET status = 'paused' WHERE status IN ('trial', 'hooked', 'active') AND last_message_at < ?`, pauseCutoff);
+    this.sql.exec(`UPDATE users SET status = 'paused' WHERE status IN ('trial', 'active') AND last_message_at < ?`, pauseCutoff);
     this.sql.exec(`UPDATE users SET status = 'churned' WHERE status = 'paused' AND last_message_at < ?`, cutoff);
   }
 
