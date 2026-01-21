@@ -16,9 +16,9 @@ tag = "v1"
 new_sqlite_classes = ["SadieAgent"]
 
 [vars]
-ACCOUNTS_URL = "https://companion-accounts.mrmicaiah.workers.dev"
+ACCOUNTS_URL = "https://companion-accounts.micaiah-tasks.workers.dev"
 
-# Secrets (set via Cloudflare dashboard or wrangler secret put):
+# Secrets (set via Cloudflare dashboard):
 # - ANTHROPIC_API_KEY
 # - TELEGRAM_BOT_TOKEN
 # - TELEGRAM_WEBHOOK_SECRET
