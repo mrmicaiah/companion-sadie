@@ -1,6 +1,10 @@
 // ============================================================
 // SADIE HARTLEY - Agent (Durable Object)
-// Version: 3.1.0 - Magic Link via companion-accounts
+// Version: 3.2.0 - Session-aware memory + 45min timeout
+// Changes:
+// - Session timeout reduced to 45 minutes (was 2 hours)
+// - Message history now scoped to current session only
+// - After gap, conversation starts fresh (memory persists, thread doesn't)
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -53,7 +57,7 @@ interface Session {
 }
 
 const TRIAL_MESSAGE_LIMIT = 25;
-const SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
+const SESSION_TIMEOUT_MS = 45 * 60 * 1000; // 45 minutes (was 2 hours)
 const EXTRACTION_DELAY_MS = 15 * 60 * 1000; // 15 minutes of silence
 const CHARACTER_NAME = 'sadie';
 
@@ -315,25 +319,28 @@ export class SadieAgent {
     }
     
     // ========================================
-    // NORMAL MESSAGE HANDLING
+    // SESSION MANAGEMENT - Now with 45min timeout
     // ========================================
-    
-    // Session management
     const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
     const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
-    const needsNewSession = !lastSession || 
-      (now.getTime() - new Date(lastSession.started_at).getTime() > SESSION_TIMEOUT_MS);
+    // Check if we need a new session (45 min gap = new conversation)
+    const lastMessageTime = lastSession ? new Date(lastSession.started_at).getTime() : 0;
+    const timeSinceLastSession = now.getTime() - lastMessageTime;
+    const needsNewSession = !lastSession || timeSinceLastSession > SESSION_TIMEOUT_MS;
     
     let sessionId: string;
+    let isNewSession = false;
     
     if (needsNewSession) {
+      // Close previous session if it exists and wasn't closed
       if (lastSession && !lastSession.ended_at) {
         await this.closeSession(lastSession.id, chatId, lastSession.message_count);
       }
       
       sessionId = `${chatId}_${Date.now()}`;
       this.sql.exec(`INSERT INTO sessions (id, chat_id, started_at, message_count) VALUES (?, ?, ?, 0)`, sessionId, chatId, now.toISOString());
+      isNewSession = true;
     } else {
       sessionId = lastSession!.id;
     }
@@ -349,8 +356,8 @@ export class SadieAgent {
       this.sql.exec(`UPDATE users SET message_count = message_count + 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
     }
     
-    // Generate response with memory
-    const response = await this.generateResponse(chatId, sessionId, user);
+    // Generate response with session-scoped messages
+    const response = await this.generateResponse(chatId, sessionId, user, isNewSession);
     
     // Store assistant response
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'assistant', ?, ?)`, chatId, sessionId, response, new Date().toISOString());
@@ -418,7 +425,7 @@ export class SadieAgent {
   }
 
   // ========================================
-  // EXISTING FUNCTIONS
+  // RESPONSE GENERATION - Now session-scoped
   // ========================================
 
   private async sendWelcomeMessage(user: User, isFirstTime: boolean): Promise<void> {
@@ -456,14 +463,20 @@ export class SadieAgent {
     }
   }
 
-  private async generateResponse(chatId: string, sessionId: string, user: User): Promise<string> {
+  private async generateResponse(chatId: string, sessionId: string, user: User, isNewSession: boolean): Promise<string> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    const recentMessages = this.sql.exec(`SELECT role, content FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray().reverse();
+    // KEY CHANGE: Only load messages from CURRENT session
+    // After a 45+ min gap, we start fresh - memory persists but conversation thread doesn't
+    const recentMessages = this.sql.exec(
+      `SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp ASC`, 
+      sessionId
+    ).toArray();
     
     const lastUserMessage = recentMessages.filter(m => m.role === 'user').pop();
     const messageContent = lastUserMessage?.content as string || '';
     
+    // Load memory (includes recent conversation summaries now)
     const memory = await loadHotMemory(this.env.MEMORY, chatId);
     const memoryContext = formatMemoryForPrompt(memory);
     
@@ -475,11 +488,20 @@ export class SadieAgent {
       }
     }
     
+    // Add context about new session if applicable
+    let sessionContext = '';
+    if (isNewSession && recentMessages.length === 1) {
+      // This is the first message after a gap
+      // Don't explicitly tell Claude about the gap - just let the lack of context speak for itself
+      // The memory system has past conversation summaries if they reference something
+      sessionContext = `\n\n[This is a fresh conversation. You remember who they are from your memory, but you don't remember the details of what you were chatting about before. If they reference something specific, check your past conversation summaries.]`;
+    }
+    
     const systemPrompt = buildPrompt(
       messageContent,
       new Date(),
       memory.relationship.phase
-    ) + memoryContext + trialContext;
+    ) + memoryContext + trialContext + sessionContext;
     
     const messages = recentMessages.map(m => ({
       role: m.role as 'user' | 'assistant',

@@ -1,6 +1,7 @@
 // ============================================================
 // MEMORY SYSTEM — R2 Storage + Schemas
 // Sadie Hartley | Fun/Play Domain
+// Updated: Added recent conversation summaries to HotMemory
 // ============================================================
 
 // ============================================================
@@ -349,30 +350,39 @@ export async function initializeUserMemory(
 
 // ============================================================
 // LOAD HOT MEMORY (for prompt building)
+// Now includes recent conversation summaries
 // ============================================================
 
 export interface HotMemory {
   core: CoreMemory;
   relationship: RelationshipMemory;
   threads: ThreadsFile;
+  recentConversations: ConversationSummary[];
 }
 
 export async function loadHotMemory(bucket: R2Bucket, chatId: string): Promise<HotMemory> {
-  const [core, relationship, threads] = await Promise.all([
+  const [core, relationship, threads, recentConversations] = await Promise.all([
     loadCore(bucket, chatId),
     loadRelationship(bucket, chatId),
-    loadThreads(bucket, chatId)
+    loadThreads(bucket, chatId),
+    searchExpansion(bucket, chatId, 2) // Last 2 months of conversations
   ]);
   
-  return { core, relationship, threads };
+  return { 
+    core, 
+    relationship, 
+    threads, 
+    recentConversations: recentConversations.slice(0, 5) // Keep last 5 summaries
+  };
 }
 
 // ============================================================
 // FORMAT MEMORY FOR PROMPT
+// Updated to include recent conversation summaries
 // ============================================================
 
 export function formatMemoryForPrompt(memory: HotMemory): string {
-  const { core, relationship, threads } = memory;
+  const { core, relationship, threads, recentConversations } = memory;
   let output = '';
   
   // Core facts
@@ -398,6 +408,15 @@ export function formatMemoryForPrompt(memory: HotMemory): string {
     }
     if (relationship.patterns_noticed.length) {
       output += ` You've noticed: ${relationship.patterns_noticed.slice(0, 2).join('; ')}.`;
+    }
+  }
+  
+  // Recent conversations - available if they reference past chats
+  if (recentConversations && recentConversations.length > 0) {
+    output += '\n\nPAST CONVERSATIONS (reference only if they bring it up):';
+    for (const conv of recentConversations) {
+      output += `\n- ${conv.date}: ${conv.summary}`;
+      if (conv.notable) output += ` [${conv.notable}]`;
     }
   }
   
