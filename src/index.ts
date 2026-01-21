@@ -7,7 +7,7 @@ import { SadieAgent } from './agent';
 export { SadieAgent };
 
 const VERSION = {
-  version: '1.0.0',
+  version: '1.0.1',
   character: 'sadie',
   display_name: 'Sadie Hartley'
 };
@@ -17,6 +17,7 @@ interface Env {
   CHARACTER: DurableObjectNamespace;
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
+  TELEGRAM_WEBHOOK_SECRET: string;
 }
 
 interface TelegramUpdate {
@@ -56,6 +57,13 @@ export default {
     }
 
     if (url.pathname === '/telegram' && request.method === 'POST') {
+      // Validate webhook is from Telegram
+      const secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+      if (secret !== env.TELEGRAM_WEBHOOK_SECRET) {
+        console.error('Invalid webhook secret');
+        return new Response('Unauthorized', { status: 401 });
+      }
+
       const update = await request.json() as TelegramUpdate;
       
       if (!update.message?.text) {
@@ -113,7 +121,10 @@ export default {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: webhookUrl })
+          body: JSON.stringify({ 
+            url: webhookUrl,
+            secret_token: env.TELEGRAM_WEBHOOK_SECRET
+          })
         }
       );
       const result = await response.json();
