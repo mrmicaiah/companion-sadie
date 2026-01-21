@@ -7,7 +7,7 @@ import { SadieAgent } from './agent';
 export { SadieAgent };
 
 const VERSION = {
-  version: '1.0.2',
+  version: '1.0.3',
   character: 'sadie',
   display_name: 'Sadie Hartley'
 };
