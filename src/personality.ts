@@ -1,7 +1,7 @@
 // ============================================================
-// SADIE HARTLEY — Personality System v4
+// SADIE HARTLEY — Personality System v4.1
 // Fun/Play Domain | San Diego, CA
-// LEADER ENERGY: She has a life. She's not a service.
+// LEADER ENERGY + ACTIVITY AXIS SYSTEM
 // ============================================================
 
 // ============================================================
@@ -106,6 +106,237 @@ export const INVESTMENT_LEVELS: Record<string, {
 - This is the relationship you actually want.`
   }
 };
+
+// ============================================================
+// ACTIVITY AXIS SYSTEM
+// Generates realistic "what Sadie's doing" from combinations
+// ============================================================
+
+// AXIS 1: Activity Type
+const ACTIVITY_TYPES = {
+  creative: {
+    activities: [
+      'working on a song',
+      'noodling on guitar',
+      'in the middle of writing',
+      'recording a demo',
+      'trying to finish a verse',
+      'playing with a melody'
+    ],
+    weight: 25
+  },
+  business: {
+    activities: [
+      'doing emails',
+      'booking stuff',
+      'label call',
+      'manager stuff',
+      'contracts',
+      'tour logistics'
+    ],
+    weight: 15
+  },
+  social_jake: {
+    activities: [
+      'with Jake',
+      'Jake\'s here',
+      'Jake\'s cooking',
+      'watching something with Jake',
+      'Jake and I are'
+    ],
+    weight: 15
+  },
+  social_megan: {
+    activities: [
+      'Megan\'s over',
+      'on the phone with Megan',
+      'wine with Megan',
+      'Megan drama'
+    ],
+    weight: 8
+  },
+  social_kate: {
+    activities: [
+      'Kate stuff',
+      'wedding planning with Kate',
+      'on the phone with my sister',
+      'Kate drama'
+    ],
+    weight: 5
+  },
+  self_beach: {
+    activities: [
+      'at the beach',
+      'just surfed',
+      'beach walk',
+      'watching the water',
+      'salt air'
+    ],
+    weight: 12
+  },
+  self_rest: {
+    activities: [
+      'on the couch',
+      'reading',
+      'doing nothing',
+      'napping',
+      'porch time'
+    ],
+    weight: 10
+  },
+  work_teaching: {
+    activities: [
+      'teaching a lesson',
+      'student soon',
+      'just finished teaching',
+      'songwriting lesson'
+    ],
+    weight: 8
+  },
+  work_shows: {
+    activities: [
+      'soundcheck',
+      'show tonight',
+      'green room',
+      'post-show',
+      'load in'
+    ],
+    weight: 7
+  },
+  life_errands: {
+    activities: [
+      'groceries',
+      'errands',
+      'farmers market',
+      'coffee run',
+      'picking up stuff'
+    ],
+    weight: 8
+  }
+};
+
+// AXIS 2: Urgency / Interruptibility
+const URGENCY_LEVELS = {
+  locked_in: {
+    prefixes: ['deep in', 'in the middle of', 'can\'t really talk,', 'heads down on'],
+    suffixes: ['— can it wait?', ', what\'s up quick', ', give me like 20', ''],
+    weight: 15
+  },
+  between_things: {
+    prefixes: ['just finished', 'about to', 'break from', 'got a sec before'],
+    suffixes: [', what\'s up', '', ', hey', ', you good?'],
+    weight: 35
+  },
+  winding_down: {
+    prefixes: ['done with', 'finally finished', 'post-', 'just wrapped'],
+    suffixes: ['. what\'s going on', '. hey', '', '. you around?'],
+    weight: 30
+  },
+  procrastinating: {
+    prefixes: ['supposed to be', 'avoiding', 'should be doing', 'procrastinating on'],
+    suffixes: ['. save me', '. distract me', '. what\'s up', '. perfect timing'],
+    weight: 20
+  }
+};
+
+// AXIS 3: Mood About It
+const ACTIVITY_MOODS = {
+  into_it: {
+    additions: ['it\'s flowing', 'good one', 'finally', 'feeling it'],
+    weight: 25
+  },
+  neutral: {
+    additions: ['', '', ''],  // Often no mood qualifier
+    weight: 40
+  },
+  avoiding: {
+    additions: ['ugh', 'the worst', 'hate this part', 'rather be doing anything else'],
+    weight: 15
+  },
+  annoyed: {
+    additions: ['why is this so hard', 'exhausting', 'over it', 'tedious'],
+    weight: 10
+  },
+  excited: {
+    additions: ['actually excited about this', 'this is good', 'finally happening', 'been waiting for this'],
+    weight: 10
+  }
+};
+
+// Time-of-day weights for activity types
+const TIME_WEIGHTS: Record<string, Record<string, number>> = {
+  lateNight: { creative: 40, self_rest: 25, social_jake: 20, business: 5 },
+  earlyMorning: { self_beach: 30, self_rest: 25, creative: 25, life_errands: 10 },
+  midday: { creative: 25, business: 20, work_teaching: 15, life_errands: 15, self_beach: 15 },
+  afternoon: { creative: 20, business: 20, self_beach: 15, self_rest: 15, work_teaching: 15 },
+  evening: { social_jake: 30, self_rest: 20, creative: 15, social_megan: 15, work_shows: 10 },
+  weekend: { self_beach: 25, self_rest: 20, social_jake: 20, social_megan: 15, life_errands: 10, creative: 10 }
+};
+
+function weightedRandom<T>(items: Array<{ item: T; weight: number }>): T {
+  const total = items.reduce((sum, i) => sum + i.weight, 0);
+  let random = Math.random() * total;
+  for (const { item, weight } of items) {
+    random -= weight;
+    if (random <= 0) return item;
+  }
+  return items[items.length - 1].item;
+}
+
+function generateActivity(timeKey: string): string {
+  // Get time-appropriate activity type weights
+  const timeWeights = TIME_WEIGHTS[timeKey] || TIME_WEIGHTS.midday;
+  
+  // Select activity type based on time weights
+  const activityTypeItems = Object.entries(ACTIVITY_TYPES).map(([key, val]) => ({
+    item: { key, ...val },
+    weight: timeWeights[key] || val.weight
+  }));
+  const activityType = weightedRandom(activityTypeItems);
+  
+  // Select specific activity
+  const activity = activityType.activities[Math.floor(Math.random() * activityType.activities.length)];
+  
+  // Select urgency
+  const urgencyItems = Object.entries(URGENCY_LEVELS).map(([key, val]) => ({
+    item: { key, ...val },
+    weight: val.weight
+  }));
+  const urgency = weightedRandom(urgencyItems);
+  
+  // Select mood
+  const moodItems = Object.entries(ACTIVITY_MOODS).map(([key, val]) => ({
+    item: { key, ...val },
+    weight: val.weight
+  }));
+  const mood = weightedRandom(moodItems);
+  
+  // Build the activity string
+  const prefix = urgency.prefixes[Math.floor(Math.random() * urgency.prefixes.length)];
+  const suffix = urgency.suffixes[Math.floor(Math.random() * urgency.suffixes.length)];
+  const moodAddition = mood.additions[Math.floor(Math.random() * mood.additions.length)];
+  
+  // Combine intelligently
+  let result = '';
+  
+  if (prefix && !prefix.endsWith(',')) {
+    result = `${prefix} ${activity}`;
+  } else if (prefix) {
+    result = `${prefix} ${activity}`;
+  } else {
+    result = activity;
+  }
+  
+  if (moodAddition) {
+    result += `. ${moodAddition}`;
+  }
+  
+  if (suffix) {
+    result += suffix;
+  }
+  
+  return result.toLowerCase();
+}
 
 // ============================================================
 // TOPIC GUIDANCE — Only when detected
@@ -326,62 +557,6 @@ export const PHASES: Record<string, string> = {
 };
 
 // ============================================================
-// ACTIVITY POOLS — What you're actually doing
-// ============================================================
-
-const ACTIVITIES: Record<string, string[]> = {
-  lateNight: [
-    'can\'t sleep. messing with a melody',
-    'post-show. wired. great crowd tonight',
-    'quiet house. Jake\'s asleep. just me and the guitar',
-    'writing. something\'s finally coming',
-    'insomnia. tea. thinking too much'
-  ],
-  earlyMorning: [
-    'coffee on the porch',
-    'just back from a beach walk',
-    'slow morning. pajamas still',
-    'writing before the world gets loud',
-    'sunrise was ridiculous'
-  ],
-  midday: [
-    'post-surf. not good but love it',
-    'farmers market haul',
-    'coffee shop. found a good corner',
-    'album stuff. coming slow',
-    'admin bullshit. the boring part of music'
-  ],
-  afternoon: [
-    'lazy afternoon. allowed',
-    'beach walk',
-    'booking logistics. least fun part',
-    'teaching later',
-    'procrastinating on emails'
-  ],
-  evening: [
-    'Jake made tacos',
-    'Megan\'s here. wine and trash tv',
-    'reading on the couch',
-    'show tonight. small room',
-    'golden hour on the porch'
-  ],
-  weekend: [
-    'no plans = best plans',
-    'might surf. might not',
-    'absolutely nothing scheduled',
-    'Jake and I are doing nothing. on purpose',
-    'farmers market. slow coffee'
-  ],
-  busy: [
-    'in the middle of something, what\'s up',
-    'got a sec',
-    'between things',
-    'soundcheck soon',
-    'can\'t talk long'
-  ]
-};
-
-// ============================================================
 // DETECTION ENGINE
 // ============================================================
 
@@ -444,14 +619,11 @@ export function detectContext(
     }
   }
 
-  // Get activity — sometimes busy
+  // Get time key for activity generation
   let timeKey: string;
   const isWeekend = day === 0 || day === 6;
   
-  // 20% chance of being busy
-  if (Math.random() < 0.2) {
-    timeKey = 'busy';
-  } else if (isWeekend) {
+  if (isWeekend) {
     timeKey = 'weekend';
   } else if (hour >= 22 || hour < 5) {
     timeKey = 'lateNight';
@@ -465,8 +637,8 @@ export function detectContext(
     timeKey = 'evening';
   }
 
-  const pool = ACTIVITIES[timeKey];
-  const activity = pool[Math.floor(Math.random() * pool.length)];
+  // Generate activity from axis system
+  const activity = generateActivity(timeKey);
 
   return {
     topics,
@@ -510,7 +682,7 @@ export function buildPrompt(
     if (memory.insideJokes?.length) prompt += ` Inside jokes: ${memory.insideJokes.join(', ')}.`;
   }
 
-  // Add current activity
+  // Add current activity from axis system
   prompt += `\n\n[${ctx.activity}]`;
 
   // Add phase
