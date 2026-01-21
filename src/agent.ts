@@ -1,10 +1,20 @@
 // ============================================================
 // SADIE HARTLEY - Agent (Durable Object)
-// Version: 1.0.2 - Test deploy after wrangler.toml fix
+// Version: 2.0.0 - Memory system integration
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
-import { SYSTEM_PROMPT, CHARACTER_INFO, getContextualPrompt, getWelcomePrompt } from './personality';
+import { 
+  buildPrompt, 
+  CHARACTER_INFO 
+} from './personality';
+import {
+  initializeUserMemory,
+  loadHotMemory,
+  formatMemoryForPrompt,
+  HotMemory
+} from './memory';
+import { runExtractions } from './extraction';
 
 interface Env {
   MEMORY: R2Bucket;
@@ -40,6 +50,8 @@ interface Session {
 }
 
 const TRIAL_MESSAGE_LIMIT = 25;
+const SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
+const EXTRACTION_DELAY_MS = 15 * 60 * 1000; // 15 minutes of silence
 
 export class SadieAgent {
   private state: DurableObjectState;
@@ -86,7 +98,8 @@ export class SadieAgent {
         started_at TEXT NOT NULL,
         ended_at TEXT,
         summary TEXT,
-        message_count INTEGER DEFAULT 0
+        message_count INTEGER DEFAULT 0,
+        extraction_done INTEGER DEFAULT 0
       );
       
       CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id);
@@ -118,6 +131,11 @@ export class SadieAgent {
         return new Response('OK');
       }
       
+      if (url.pathname === '/rhythm/processExtractions') {
+        await this.processStaleExtractions();
+        return new Response('OK');
+      }
+      
       if (url.pathname === '/rhythm/cleanup') {
         await this.cleanup();
         return new Response('OK');
@@ -137,7 +155,10 @@ export class SadieAgent {
         const sessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 10`, chatId).toArray();
         const recentMessages = this.sql.exec(`SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray();
         
-        return this.jsonResponse({ user, sessions, recentMessages });
+        // Load R2 memory
+        const memory = await loadHotMemory(this.env.MEMORY, chatId as string);
+        
+        return this.jsonResponse({ user, sessions, recentMessages, memory });
       }
       
       if (url.pathname === '/debug/stats') {
@@ -171,6 +192,7 @@ export class SadieAgent {
     const { content, chatId, user: telegramUser, refCode } = data;
     const now = new Date();
     
+    // Get or create user
     const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
     let user = userResult.length > 0 ? userResult[0] as User : null;
     const isFirstTimeUser = !user;
@@ -184,31 +206,38 @@ export class SadieAgent {
       
       const newUserResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
       user = newUserResult[0] as User;
+      
+      // Initialize R2 memory for new user
+      await initializeUserMemory(this.env.MEMORY, chatId, telegramUser.firstName);
     }
     
+    // Handle /start command
     if (content === '__START__') {
       await this.sendWelcomeMessage(user, isFirstTimeUser);
       return;
     }
     
+    // Check trial limit
     if (user.status === 'trial' && user.trial_messages_remaining <= 0) {
       await this.sendMessage(chatId, 
-        `Hey ${user.first_name}! You've used all your free messages. To keep chatting, upgrade to unlimited access! 💬\n\n[Link to upgrade coming soon]`
+        `hey ${user.first_name}! you've used all your free messages. to keep chatting, upgrade to unlimited access 💬\n\n[link coming soon]`
       );
       return;
     }
     
+    // Session management
     const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1`, chatId).toArray();
     const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
     
     const needsNewSession = !lastSession || 
-      (now.getTime() - new Date(lastSession.started_at).getTime() > 2 * 60 * 60 * 1000);
+      (now.getTime() - new Date(lastSession.started_at).getTime() > SESSION_TIMEOUT_MS);
     
     let sessionId: string;
     
     if (needsNewSession) {
+      // Close previous session and run extractions
       if (lastSession && !lastSession.ended_at) {
-        await this.closeSession(lastSession.id, chatId);
+        await this.closeSession(lastSession.id, chatId, lastSession.message_count);
       }
       
       sessionId = `${chatId}_${Date.now()}`;
@@ -217,29 +246,47 @@ export class SadieAgent {
       sessionId = lastSession!.id;
     }
     
+    // Store user message
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)`, chatId, sessionId, content, now.toISOString());
-    
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
     this.sql.exec(`UPDATE users SET message_count = message_count + 1, trial_messages_remaining = trial_messages_remaining - 1, last_message_at = ? WHERE chat_id = ?`, now.toISOString(), chatId);
     
+    // Generate response with memory
     const response = await this.generateResponse(chatId, sessionId, user);
     
+    // Store assistant response
     this.sql.exec(`INSERT INTO messages (chat_id, session_id, role, content, timestamp) VALUES (?, ?, 'assistant', ?, ?)`, chatId, sessionId, response, new Date().toISOString());
     this.sql.exec(`UPDATE sessions SET message_count = message_count + 1 WHERE id = ?`, sessionId);
     
+    // Send to Telegram
     await this.sendMessage(chatId, response);
+    
+    // Update user status
     this.updateUserStatus(chatId);
   }
 
   private async sendWelcomeMessage(user: User, isFirstTime: boolean): Promise<void> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
-    const welcomePrompt = getWelcomePrompt(user.first_name, isFirstTime);
+    
+    // Load memory for returning users
+    const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
+    const memoryContext = formatMemoryForPrompt(memory);
+    
+    const welcomeContext = isFirstTime 
+      ? `\n\n[CONTEXT: ${user.first_name} just started chatting with you for the first time. Be warm, introduce yourself naturally, maybe ask what brings them here or what's on their mind. Keep it light.]`
+      : `\n\n[CONTEXT: ${user.first_name} is back! You've talked before. Be casual and welcoming, maybe reference something from your history if relevant.]`;
+    
+    const systemPrompt = buildPrompt(
+      '[new conversation starting]',
+      new Date(),
+      memory.relationship.phase
+    ) + memoryContext + welcomeContext;
     
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 300,
-      system: SYSTEM_PROMPT + `\n\n${welcomePrompt}`,
-      messages: [{ role: 'user', content: '[SYSTEM: User just clicked to chat from the website. Send your opening message.]' }]
+      system: systemPrompt,
+      messages: [{ role: 'user', content: '[Send your opening message]' }]
     });
     
     const textBlock = response.content.find(b => b.type === 'text');
@@ -251,23 +298,25 @@ export class SadieAgent {
   private async generateResponse(chatId: string, sessionId: string, user: User): Promise<string> {
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
+    // Load conversation history
     const recentMessages = this.sql.exec(`SELECT role, content FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 20`, chatId).toArray().reverse();
     
-    const previousSessions = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND id != ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 5`, chatId, sessionId).toArray() as Session[];
+    // Get the last user message for context detection
+    const lastUserMessage = recentMessages.filter(m => m.role === 'user').pop();
+    const messageContent = lastUserMessage?.content as string || '';
     
-    const sessionList = previousSessions.map(s => `- ${s.started_at}: ${s.summary}`).join('\n');
+    // Load R2 memory
+    const memory = await loadHotMemory(this.env.MEMORY, chatId);
+    const memoryContext = formatMemoryForPrompt(memory);
     
-    const contextPrompt = getContextualPrompt({
-      currentTime: new Date(),
-      isNewSession: recentMessages.length <= 2,
-      previousSessionSummary: previousSessions[0]?.summary,
-      sessionList: sessionList || undefined
-    });
+    // Build dynamic prompt based on message content and phase
+    const systemPrompt = buildPrompt(
+      messageContent,
+      new Date(),
+      memory.relationship.phase
+    ) + memoryContext;
     
-    const userContext = `\n## USER INFO\nName: ${user.first_name}${user.last_name ? ' ' + user.last_name : ''}\nMessages exchanged: ${user.message_count}\n`;
-    
-    const systemPrompt = SYSTEM_PROMPT + userContext + contextPrompt;
-    
+    // Format messages for API
     const messages = recentMessages.map(m => ({
       role: m.role as 'user' | 'assistant',
       content: m.content as string
@@ -309,25 +358,69 @@ export class SadieAgent {
     }
   }
 
-  private async closeSession(sessionId: string, chatId: string): Promise<void> {
-    const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, sessionId).toArray();
+  private async closeSession(sessionId: string, chatId: string, messageCount: number): Promise<void> {
+    const now = new Date().toISOString();
+    this.sql.exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, now, sessionId);
     
-    if (messages.length < 2) {
-      this.sql.exec(`UPDATE sessions SET ended_at = ? WHERE id = ?`, new Date().toISOString(), sessionId);
-      return;
+    // Run extractions if enough messages
+    if (messageCount >= 4) {
+      const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, sessionId).toArray();
+      const transcript = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+      
+      const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
+      
+      try {
+        const result = await runExtractions(
+          this.env.MEMORY,
+          anthropic,
+          chatId,
+          transcript,
+          messageCount
+        );
+        
+        console.log(`Extractions for ${chatId}:`, result);
+        this.sql.exec(`UPDATE sessions SET extraction_done = 1 WHERE id = ?`, sessionId);
+      } catch (e) {
+        console.error('Extraction failed:', e);
+      }
     }
+  }
+
+  private async processStaleExtractions(): Promise<void> {
+    // Find sessions that ended more than 15 min ago without extractions
+    const cutoff = new Date(Date.now() - EXTRACTION_DELAY_MS).toISOString();
+    
+    const staleSessions = this.sql.exec(`
+      SELECT s.*, u.chat_id as user_chat_id
+      FROM sessions s
+      JOIN users u ON s.chat_id = u.chat_id
+      WHERE s.ended_at IS NOT NULL 
+        AND s.ended_at < ?
+        AND s.extraction_done = 0
+        AND s.message_count >= 4
+      LIMIT 5
+    `, cutoff).toArray();
     
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
-    const conversationText = messages.map(m => `${m.role}: ${m.content}`).join('\n');
     
-    const summaryResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 150,
-      messages: [{ role: 'user', content: `Summarize this conversation in 1-2 sentences:\n\n${conversationText}` }]
-    });
-    
-    const summary = summaryResponse.content.find(b => b.type === 'text')?.text || null;
-    this.sql.exec(`UPDATE sessions SET ended_at = ?, summary = ? WHERE id = ?`, new Date().toISOString(), summary, sessionId);
+    for (const session of staleSessions) {
+      const messages = this.sql.exec(`SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp`, session.id).toArray();
+      const transcript = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+      
+      try {
+        await runExtractions(
+          this.env.MEMORY,
+          anthropic,
+          session.chat_id as string,
+          transcript,
+          session.message_count as number
+        );
+        
+        this.sql.exec(`UPDATE sessions SET extraction_done = 1 WHERE id = ?`, session.id);
+      } catch (e) {
+        console.error(`Extraction failed for session ${session.id}:`, e);
+      }
+    }
   }
 
   private async checkAllUsersForOutreach(): Promise<void> {
@@ -348,20 +441,40 @@ export class SadieAgent {
   }
 
   private async sendProactiveMessage(user: User): Promise<void> {
-    const lastSessionResult = this.sql.exec(`SELECT * FROM sessions WHERE chat_id = ? AND summary IS NOT NULL ORDER BY started_at DESC LIMIT 1`, user.chat_id).toArray();
-    const lastSession = lastSessionResult.length > 0 ? lastSessionResult[0] as Session : null;
-    
     const anthropic = new Anthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
     
-    const prompt = lastSession?.summary 
-      ? `Based on your last conversation about: "${lastSession.summary}", send a brief, natural check-in to ${user.first_name}.`
-      : `Send a brief, natural check-in message to ${user.first_name}.`;
+    // Load memory for context
+    const memory = await loadHotMemory(this.env.MEMORY, user.chat_id);
+    const memoryContext = formatMemoryForPrompt(memory);
+    
+    // Check for active threads to follow up on
+    const activeThreads = memory.threads.active_threads.filter(t => {
+      const followUp = new Date(t.follow_up_after);
+      return !t.resolved && followUp <= new Date();
+    });
+    
+    let outreachContext = `\n\n[CONTEXT: It's been a day or two since ${user.first_name} messaged. Send a brief, natural check-in. `;
+    
+    if (activeThreads.length > 0) {
+      outreachContext += `You have something to follow up on: "${activeThreads[0].prompt}"`;
+    } else if (memory.relationship.inside_jokes.length > 0) {
+      outreachContext += `Maybe reference something from your history together.`;
+    } else {
+      outreachContext += `Keep it light and casual.`;
+    }
+    outreachContext += `]`;
+    
+    const systemPrompt = buildPrompt(
+      '[proactive outreach]',
+      new Date(),
+      memory.relationship.phase
+    ) + memoryContext + outreachContext;
     
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 200,
-      system: SYSTEM_PROMPT + `\n\n${prompt}`,
-      messages: [{ role: 'user', content: '[SYSTEM: Generate proactive outreach]' }]
+      system: systemPrompt,
+      messages: [{ role: 'user', content: '[Send a casual check-in message]' }]
     });
     
     const textBlock = response.content.find(b => b.type === 'text');
@@ -374,6 +487,7 @@ export class SadieAgent {
   private async cleanup(): Promise<void> {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     
+    // Archive old sessions to R2
     const oldSessions = this.sql.exec(`SELECT * FROM sessions WHERE ended_at < ?`, cutoff).toArray();
     
     if (oldSessions.length > 0) {
@@ -386,6 +500,7 @@ export class SadieAgent {
       }
     }
     
+    // Update user statuses
     const pauseCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
     this.sql.exec(`UPDATE users SET status = 'paused' WHERE status IN ('trial', 'hooked', 'active') AND last_message_at < ?`, pauseCutoff);
     this.sql.exec(`UPDATE users SET status = 'churned' WHERE status = 'paused' AND last_message_at < ?`, cutoff);
