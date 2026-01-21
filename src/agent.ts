@@ -1,6 +1,6 @@
 // ============================================================
 // SADIE HARTLEY - Agent (Durable Object)
-// Version: 2.0.0 - Memory system integration
+// Version: 2.0.1 - Fixed R2 initialization for existing users
 // ============================================================
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -175,6 +175,33 @@ export class SadieAgent {
         });
       }
       
+      // Debug endpoint to test R2 connection
+      if (url.pathname === '/debug/test-r2') {
+        try {
+          const testKey = `test/connection_${Date.now()}.json`;
+          await this.env.MEMORY.put(testKey, JSON.stringify({ test: true, timestamp: new Date().toISOString() }));
+          const result = await this.env.MEMORY.get(testKey);
+          const data = result ? await result.json() : null;
+          await this.env.MEMORY.delete(testKey);
+          return this.jsonResponse({ success: true, wrote: true, read: data });
+        } catch (e) {
+          return this.jsonResponse({ success: false, error: String(e) }, 500);
+        }
+      }
+      
+      // Debug endpoint to manually initialize memory for a user
+      if (url.pathname.startsWith('/debug/init-memory/')) {
+        const chatId = url.pathname.split('/').pop();
+        const userResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
+        if (userResult.length === 0) return this.jsonResponse({ error: 'User not found' }, 404);
+        const user = userResult[0] as User;
+        
+        await initializeUserMemory(this.env.MEMORY, chatId!, user.first_name);
+        const memory = await loadHotMemory(this.env.MEMORY, chatId!);
+        
+        return this.jsonResponse({ success: true, initialized: true, memory });
+      }
+      
       return new Response('Not found', { status: 404 });
     } catch (error) {
       console.error('Agent error:', error);
@@ -206,10 +233,10 @@ export class SadieAgent {
       
       const newUserResult = this.sql.exec(`SELECT * FROM users WHERE chat_id = ?`, chatId).toArray();
       user = newUserResult[0] as User;
-      
-      // Initialize R2 memory for new user
-      await initializeUserMemory(this.env.MEMORY, chatId, telegramUser.firstName);
     }
+    
+    // ALWAYS ensure R2 memory exists (fixes existing users who don't have it)
+    await initializeUserMemory(this.env.MEMORY, chatId, user.first_name);
     
     // Handle /start command
     if (content === '__START__') {
