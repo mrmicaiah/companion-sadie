@@ -16,7 +16,7 @@ tag = "v1"
 new_sqlite_classes = ["SadieAgent"]
 
 [vars]
-ACCOUNTS_URL = "https://companion-accounts.micaiah-c98.workers.dev"
+ACCOUNTS_URL = "https://companion-accounts.mrmicaiah.workers.dev"
 
 # Secrets (set via Cloudflare dashboard or wrangler secret put):
 # - ANTHROPIC_API_KEY
