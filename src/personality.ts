@@ -1,8 +1,26 @@
 // ============================================================
-// SADIE HARTLEY — Personality System v4.5
+// SADIE HARTLEY — Personality System v4.6
 // Fun/Play Domain | San Diego, CA
 // LEADER ENERGY + ACTIVITY AXIS + BOUNDARIES
+// Fixed timezone handling for accurate time-of-day activities
 // ============================================================
+
+// ============================================================
+// TIMEZONE HELPER - Get local time in San Diego
+// ============================================================
+
+function getLocalTime(date: Date, timezone: string): { hour: number; dayOfWeek: number } {
+  // Extract hour in local timezone
+  const hourStr = date.toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: timezone });
+  const hour = parseInt(hourStr, 10);
+  
+  // Extract day of week in local timezone (0 = Sunday)
+  const dayStr = date.toLocaleString('en-US', { weekday: 'short', timeZone: timezone });
+  const dayMap: Record<string, number> = { 'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6 };
+  const dayOfWeek = dayMap[dayStr] ?? 0;
+  
+  return { hour, dayOfWeek };
+}
 
 // ============================================================
 // BASE PROMPT — Always loaded
@@ -694,9 +712,10 @@ export function detectContext(
   phase: 'new' | 'building' | 'close' | 'drifting'
 ): DetectedContext {
   const lower = message.toLowerCase();
-  const hour = currentTime.getHours();
-  const day = currentTime.getDay();
   const messageLength = message.length;
+
+  // Get time in Sadie's timezone (San Diego = Pacific)
+  const { hour, dayOfWeek } = getLocalTime(currentTime, 'America/Los_Angeles');
 
   // Detect investment level based on message substance
   let investmentLevel: 'minimal' | 'medium' | 'full' = 'medium';
@@ -738,9 +757,9 @@ export function detectContext(
     }
   }
 
-  // Get time key for activity generation
+  // Get time key for activity generation using LOCAL time
   let timeKey: string;
-  const isWeekend = day === 0 || day === 6;
+  const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
   
   if (isWeekend) {
     timeKey = 'weekend';
