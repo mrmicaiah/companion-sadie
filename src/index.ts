@@ -1,14 +1,15 @@
 // ============================================================
 // SADIE HARTLEY - Character Worker
-// Version: 2.1.0 - Magic Link via companion-accounts
+// Version: 2.2.0 - Added admin endpoints for Mind System
 // ============================================================
 
 import { SadieAgent } from './agent';
+import { initializeR2Structure, verifyR2Structure } from './init-r2';
 
 export { SadieAgent };
 
 const VERSION = {
-  version: '2.1.0',
+  version: '2.2.0',
   character: 'sadie',
   display_name: 'Sadie Hartley'
 };
@@ -47,6 +48,88 @@ export default {
     
     const id = env.CHARACTER.idFromName('sadie-v1');
     const character = env.CHARACTER.get(id);
+
+    // ============================================================
+    // ADMIN API - Character Mind System
+    // ============================================================
+    
+    if (url.pathname.startsWith('/admin/')) {
+      const path = url.pathname.replace('/admin/', '');
+      
+      // POST /admin/init-r2 - Initialize R2 structure with JSON files
+      if (path === 'init-r2' && request.method === 'POST') {
+        const result = await initializeR2Structure(env.MEMORY);
+        return new Response(JSON.stringify(result, null, 2), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // GET /admin/verify-r2 - Verify R2 structure exists
+      if (path === 'verify-r2' && request.method === 'GET') {
+        const result = await verifyR2Structure(env.MEMORY);
+        return new Response(JSON.stringify(result, null, 2), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // GET /admin/source - List all source files
+      if (path === 'source' && request.method === 'GET') {
+        const files: string[] = [];
+        const listed = await env.MEMORY.list({ prefix: 'character/' });
+        for (const obj of listed.objects) {
+          files.push(obj.key);
+        }
+        return new Response(JSON.stringify({ files }, null, 2), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // GET /admin/source/{path} - Read a specific source file
+      if (path.startsWith('source/') && request.method === 'GET') {
+        const filePath = path.replace('source/', '');
+        const obj = await env.MEMORY.get(filePath);
+        if (!obj) {
+          return new Response('Not found', { status: 404 });
+        }
+        const content = await obj.text();
+        return new Response(content, {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // PUT /admin/source/{path} - Update a source file
+      if (path.startsWith('source/') && request.method === 'PUT') {
+        const filePath = path.replace('source/', '');
+        const content = await request.text();
+        
+        // Validate JSON
+        try {
+          JSON.parse(content);
+        } catch (e) {
+          return new Response(`Invalid JSON: ${(e as Error).message}`, { status: 400 });
+        }
+        
+        // Validate path is in character/
+        if (!filePath.startsWith('character/')) {
+          return new Response('Can only write to character/ directory', { status: 400 });
+        }
+        
+        await env.MEMORY.put(filePath, content, {
+          httpMetadata: { contentType: 'application/json' }
+        });
+        
+        return new Response(JSON.stringify({ success: true, path: filePath }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // If no admin route matched, pass to character DO for debug routes
+      return character.fetch(request);
+    }
+
+    // ============================================================
+    // STANDARD ROUTES
+    // ============================================================
 
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({ status: 'ok', ...VERSION }, null, 2), {
@@ -145,7 +228,6 @@ export default {
     }
 
     if (url.pathname.startsWith('/debug/') || 
-        url.pathname.startsWith('/admin/') ||
         url.pathname.startsWith('/billing/')) {
       return character.fetch(request);
     }
