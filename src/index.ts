@@ -1,15 +1,22 @@
 // ============================================================
 // SADIE HARTLEY - Character Worker
-// Version: 2.2.0 - Added admin endpoints for Mind System
+// Version: 2.3.0 - Added compiler and full admin API
 // ============================================================
 
 import { SadieAgent } from './agent';
 import { initializeR2Structure, verifyR2Structure } from './init-r2';
+import { 
+  handleCompileEndpoint, 
+  handleSourceList, 
+  handleSourceRead, 
+  handleSourceWrite,
+  handleSourceDelete
+} from './compiler';
 
 export { SadieAgent };
 
 const VERSION = {
-  version: '2.2.0',
+  version: '2.3.0',
   character: 'sadie',
   display_name: 'Sadie Hartley'
 };
@@ -72,55 +79,38 @@ export default {
         });
       }
       
+      // POST /admin/compile - Compile source files into character.json
+      if (path === 'compile' && request.method === 'POST') {
+        return handleCompileEndpoint(env.MEMORY, 'sadie');
+      }
+      
+      // GET /admin/compiled - View the compiled character.json
+      if (path === 'compiled' && request.method === 'GET') {
+        return handleSourceRead(env.MEMORY, 'character.json');
+      }
+      
       // GET /admin/source - List all source files
       if (path === 'source' && request.method === 'GET') {
-        const files: string[] = [];
-        const listed = await env.MEMORY.list({ prefix: 'character/' });
-        for (const obj of listed.objects) {
-          files.push(obj.key);
-        }
-        return new Response(JSON.stringify({ files }, null, 2), {
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return handleSourceList(env.MEMORY);
       }
       
       // GET /admin/source/{path} - Read a specific source file
       if (path.startsWith('source/') && request.method === 'GET') {
         const filePath = path.replace('source/', '');
-        const obj = await env.MEMORY.get(filePath);
-        if (!obj) {
-          return new Response('Not found', { status: 404 });
-        }
-        const content = await obj.text();
-        return new Response(content, {
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return handleSourceRead(env.MEMORY, filePath);
       }
       
       // PUT /admin/source/{path} - Update a source file
       if (path.startsWith('source/') && request.method === 'PUT') {
         const filePath = path.replace('source/', '');
         const content = await request.text();
-        
-        // Validate JSON
-        try {
-          JSON.parse(content);
-        } catch (e) {
-          return new Response(`Invalid JSON: ${(e as Error).message}`, { status: 400 });
-        }
-        
-        // Validate path is in character/
-        if (!filePath.startsWith('character/')) {
-          return new Response('Can only write to character/ directory', { status: 400 });
-        }
-        
-        await env.MEMORY.put(filePath, content, {
-          httpMetadata: { contentType: 'application/json' }
-        });
-        
-        return new Response(JSON.stringify({ success: true, path: filePath }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return handleSourceWrite(env.MEMORY, filePath, content);
+      }
+      
+      // DELETE /admin/source/{path} - Delete a source file (non-critical only)
+      if (path.startsWith('source/') && request.method === 'DELETE') {
+        const filePath = path.replace('source/', '');
+        return handleSourceDelete(env.MEMORY, filePath);
       }
       
       // If no admin route matched, pass to character DO for debug routes
